@@ -41,12 +41,12 @@ class ValidateTest(unittest.TestCase):
         self.assertIn("more than one PR for web", agent_result.validate(data, REPOS))
 
     def test_rejects_title_that_would_break_tsv(self):
-        for title in ["a\tb", "a\nb", "", "x" * 121]:
+        for title in ["a\tb", "a\nb", "a\r", "a\x1b[31m", "", "x" * 121, 42]:
             with self.subTest(title=title):
                 self.assertTrue(agent_result.validate({"decisions": [], "prs": [pr(title=title)]}, REPOS))
 
     def test_rejects_short_id_that_would_break_tsv(self):
-        for sid in ["A\tB", "A\nB", "", "../x", "a b"]:
+        for sid in ["A\tB", "A\nB", "A\n", "", "../x", "a b", 123, None]:
             with self.subTest(short_id=sid):
                 bad_decision = {"decisions": [{"short_id": sid, "verdict": "fixed", "reason": ""}], "prs": []}
                 self.assertTrue(agent_result.validate(bad_decision, REPOS))

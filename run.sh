@@ -61,18 +61,42 @@ if [ "$dotenv_used" = "1" ]; then
   log "WARN: secrets loaded from $AGENT_HOME/.env - code run by the agent can read that file; use a root-only EnvironmentFile for unattended runs"
 fi
 
+# Binaries used next to a token must not be replaceable by the agent user
+for bin in git gh python3; do
+  bin_path="$(command -v "$bin" || true)"
+  if [ -z "$bin_path" ]; then log "ERROR: $bin not found"; exit 2; fi
+  if [ -w "$bin_path" ] || [ -w "$(dirname "$bin_path")" ]; then
+    log "WARN: $bin_path is writable by $(id -un) - code run by the agent could replace it; install $bin system-wide"
+  fi
+done
+
 # Every process whose code the agent can influence (dependency install scripts, the
 # dev server, the test gate) runs with these removed from its environment.
 scrub_secrets() { unset SENTRY_AUTH_TOKEN GH_TOKEN GITHUB_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; }
 
-# git with GH_TOKEN as credentials (via gh), without touching the global git config.
-# Hooks and fsmonitor are disabled so no repo-controlled program runs next to the token.
+# Everything below that holds a token ignores config the agent user can write:
+# global/system git config (~/.gitconfig) and gh's config dir (a fresh one per call).
+git_fresh() { GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git "$@"; }
+gh_clean() {
+  local d rc=0
+  d="$(mktemp -d)"
+  GH_CONFIG_DIR="$d" gh "$@" || rc=$?
+  rm -rf "$d"
+  return "$rc"
+}
+# git with GH_TOKEN as credentials (via gh). Hooks and fsmonitor are disabled and TLS
+# verification forced, so no repo-controlled program or setting sits next to the token.
 git_auth() {
-  git -c core.fsmonitor=false -c core.hooksPath=/dev/null \
-    -c credential.helper= -c 'credential.https://github.com.helper=!gh auth git-credential' "$@"
+  local d rc=0
+  d="$(mktemp -d)"
+  GH_CONFIG_DIR="$d" git_fresh -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+    -c http.sslVerify=true -c credential.helper= \
+    -c 'credential.https://github.com.helper=!gh auth git-credential' "$@" || rc=$?
+  rm -rf "$d"
+  return "$rc"
 }
 # Plain git for inspecting agent-touched clones: same hardening, no credentials
-git_safe() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"; }
+git_safe() { git_fresh -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"; }
 
 # SHA-256 over the parts of .git the agent could abuse to run code or redirect a push
 # (config: fsmonitor, aliases, filters, URLs; hooks/; info/attributes)
@@ -80,7 +104,7 @@ git_fingerprint() {
   python3 - "$1/.git" <<'PY'
 import hashlib, os, sys
 root, h = sys.argv[1], hashlib.sha256()
-for part in ("config", "hooks", "info"):
+for part in ("config", "commondir", "hooks", "info"):
     base = os.path.join(root, part)
     paths = [base] if os.path.isfile(base) else sorted(
         os.path.join(d, f) for d, _, files in os.walk(base) for f in files)
@@ -130,15 +154,54 @@ run_gate() {
   )
 }
 
-# 0 if the agent's diff touches a protected path prefix
+# Run the gate in its own process group and kill the group afterwards, so nothing
+# the agent's code started (watchers, daemons) is still running when we push.
+gate_isolated() {
+  if ! command -v setsid >/dev/null; then run_gate "$@"; return; fi
+  export -f run_gate scrub_secrets git_fresh
+  export AGENT_HOME
+  local pgid rc=0
+  setsid bash -c 'run_gate "$1" "$2"' _ "$1" "$2" &
+  pgid=$!
+  wait "$pgid" || rc=$?
+  kill -- "-$pgid" 2>/dev/null || true
+  return "$rc"
+}
+
+# 0 (and prints the file) if the diff base...head touches a protected path prefix
 touches_protected() {
-  local dir="$1" file prefix
+  local repo="$1" base="$2" head="$3" file prefix
   while IFS= read -r file; do
     for prefix in $PROTECTED_PATHS; do
       case "$file" in "$prefix"*) echo "$file"; return 0 ;; esac
     done
-  done < <(git_safe -C "$dir" diff --name-only "origin/$BASE_BRANCH...HEAD")
+  done < <(git_fresh -C "$repo" diff --name-only "$base...$head")
   return 1
+}
+
+# Push from a throwaway bare repo that nothing else has touched, never from the
+# agent's clone (its config, hooks and refs are agent-writable). Only the pinned
+# commit travels from that clone, over a local fetch that runs without secrets.
+# The checks run again here, on exactly the commit that gets pushed.
+push_verified() {
+  local dir="$1" slug="$2" sha="$3" repo protected
+  repo="$(mktemp -d)/push.git"
+  git_fresh init --quiet --bare "$repo"
+  (scrub_secrets; git_fresh -C "$repo" fetch --quiet --no-tags "$dir" "+refs/heads/$BRANCH:refs/heads/candidate") || return 1
+  if [ "$(git_fresh -C "$repo" rev-parse refs/heads/candidate)" != "$sha" ]; then
+    echo "branch moved after it was verified" >&2; return 1
+  fi
+  # The real base, straight from GitHub
+  git_auth -C "$repo" fetch --quiet --no-tags "https://github.com/$slug.git" "+refs/heads/$BASE_BRANCH:refs/heads/base" || return 1
+  if [ "$(git_fresh -C "$repo" rev-list --count base..candidate)" -eq 0 ]; then
+    echo "no commits on top of $BASE_BRANCH" >&2; return 1
+  fi
+  if protected="$(touches_protected "$repo" base candidate)"; then
+    echo "diff touches protected path $protected" >&2; return 1
+  fi
+  if [ "$DRY_RUN" = "1" ]; then echo "DRY_RUN: verified $sha, not pushing"; return 0; fi
+  # Push the verified SHA itself, not whatever a branch name points to by now
+  git_auth -C "$repo" push --quiet "https://github.com/$slug.git" "$sha:refs/heads/$BRANCH"
 }
 
 # --- 1. Fresh branch from origin/$BASE_BRANCH in each dedicated clone ------------
@@ -173,7 +236,7 @@ done
 
 # --- 2. Inputs for the agent ------------------------------------------------------
 for slug in "${REPOS[@]}"; do
-  gh pr list --repo "$slug" --state open --limit 100 \
+  gh_clean pr list --repo "$slug" --state open --limit 100 \
     --json number,title,headRefName,url > "$RUN_DIR/open_prs_${slug#*/}.json"
 done
 
@@ -299,6 +362,9 @@ fi
 python3 "$AGENT_HOME/agent_result.py" decisions "$result" "$TODAY" | tee -a "$STATE"
 
 # --- 6. Push + PR, one per repo with a verified fix -------------------------------
+# Nothing that runs agent-edited code may still be alive once tokens are used again
+cleanup
+dev_pgid=""
 # Read from fd 3 so git/gh inside the loop can't eat the loop's input.
 while IFS=$'\t' read -r name short_id title <&3; do
   dir="$WORK_DIR/$name"
@@ -317,12 +383,11 @@ while IFS=$'\t' read -r name short_id title <&3; do
   if [ -n "$(git_safe -C "$dir" status --porcelain)" ]; then
     reject "uncommitted changes left behind"; continue
   fi
-  if protected="$(touches_protected "$dir")"; then
-    reject "diff touches protected path $protected"; continue
-  fi
+  # Pin the commit now: this exact SHA is what gets re-checked and pushed later
+  sha="$(git_safe -C "$dir" rev-parse HEAD)"
   # Independent gate: don't trust the agent's word that tests pass
-  log "$name: running test gate"
-  if ! run_gate "$dir" "$name" > "$RUN_DIR/gate_$name.log" 2>&1; then
+  log "$name: running test gate on $sha"
+  if ! gate_isolated "$dir" "$name" > "$RUN_DIR/gate_$name.log" 2>&1; then
     reject "test gate FAILED (see gate_$name.log)"; continue
   fi
   # Checked AFTER the gate: the gate runs agent-written code that could touch .git.
@@ -332,13 +397,15 @@ while IFS=$'\t' read -r name short_id title <&3; do
     rm -rf "$dir"
     continue
   fi
+  # Authoritative checks + push happen in a fresh repo, on the pinned SHA
+  if ! push_verified "$dir" "$slug" "$sha" >> "$RUN_DIR/gate_$name.log" 2>&1; then
+    reject "verification before push failed (see gate_$name.log)"; continue
+  fi
   if [ "$DRY_RUN" = "1" ]; then
-    log "$name: DRY_RUN - would push $BRANCH and open PR: $title"
+    log "$name: DRY_RUN - verified $sha, would open PR: $title"
     continue
   fi
-  # --no-verify: the same pre-push hook just passed in the gate above
-  git_auth -C "$dir" push --quiet --no-verify -u origin "$BRANCH"
-  pr_url="$(gh pr create --repo "$slug" --base "$BASE_BRANCH" --head "$BRANCH" \
+  pr_url="$(gh_clean pr create --repo "$slug" --base "$BASE_BRANCH" --head "$BRANCH" \
     --title "$title" --body-file "$RUN_DIR/pr_body_$name.md")"
   log "$name: opened $pr_url"
 done 3< <(python3 "$AGENT_HOME/agent_result.py" prs "$result" "$RUN_DIR")

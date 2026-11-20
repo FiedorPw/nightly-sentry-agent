@@ -17,7 +17,17 @@ import sys
 # Sentry short IDs look like WEB-1A / MY_PROJECT-42. A strict pattern keeps agent
 # output from smuggling tabs, newlines or shell/path characters into the TSV state
 # file, file names or the exclude matching.
-SHORT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# Used with fullmatch(): `$` alone would also accept a trailing "\n".
+SHORT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+
+def valid_short_id(value) -> bool:
+    # Non-strings are rejected outright instead of being str()-ed into something valid
+    return isinstance(value, str) and SHORT_ID.fullmatch(value) is not None
+
+
+def has_control_chars(text: str) -> bool:
+    return any(ord(c) < 32 or ord(c) == 127 for c in text)
 VERDICTS = {"fixed", "skip_noise", "skip_low_impact", "skip_hard", "skip_duplicate", "abandoned"}
 # PR description footer, so reviewers know where the PR came from
 FOOTER = (
@@ -37,23 +47,23 @@ def validate(data: dict, repos: set[str]) -> list[str]:
         return ["result.json needs 'decisions' and 'prs' arrays"]
     errors = []
     for d in data["decisions"]:
-        if d.get("verdict") not in VERDICTS or not SHORT_ID.match(str(d.get("short_id", ""))):
+        if d.get("verdict") not in VERDICTS or not valid_short_id(d.get("short_id")):
             errors.append(f"bad decision: {d}")
     seen_repos = set()
     for pr in data["prs"]:
         repo = pr.get("repo")
-        if repo not in repos:
+        if not isinstance(repo, str) or repo not in repos:
             errors.append(f"unknown repo: {repo}")
-        if not SHORT_ID.match(str(pr.get("short_id", ""))):
+        if not valid_short_id(pr.get("short_id")):
             errors.append(f"bad short_id for {repo}: {pr.get('short_id')!r}")
         if repo in seen_repos:
             errors.append(f"more than one PR for {repo}")
         seen_repos.add(repo)
-        title = pr.get("title") or ""
-        # Titles go to the shell as one tab-separated field: no tabs/newlines allowed
-        if not title or len(title) > 120 or "\t" in title or "\n" in title:
+        title = pr.get("title")
+        # Titles go to the shell as one tab-separated field: no control characters
+        if not isinstance(title, str) or not title or len(title) > 120 or has_control_chars(title):
             errors.append(f"bad title for {repo}: {title!r}")
-        if not pr.get("body"):
+        if not isinstance(pr.get("body"), str) or not pr.get("body"):
             errors.append(f"empty body for {repo}")
     return errors
 

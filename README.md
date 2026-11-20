@@ -135,21 +135,32 @@ Assume that code can be hostile. What the script does about it:
    server and the test gate run with *all* tokens stripped.
 2. **Narrow tools.** Claude is denied `git push`, `gh`, `curl`, `wget`, WebFetch and
    WebSearch, and may run only git plus the prefixes in `ALLOWED_BASH`.
-3. **`.git` integrity.** A SHA-256 of `.git/config`, `.git/hooks/` and `.git/info/` is
-   taken after setup and compared after the gate, right before pushing. On a mismatch
-   nothing is pushed and the clone is deleted. Git commands near the token run with
-   hooks and fsmonitor disabled.
-4. **Protected paths.** A diff touching `PROTECTED_PATHS` (default `.github/ .githooks/
+3. **Push from a clean room.** The agent's clone never runs next to the token. The
+   commit SHA is pinned before the gate. After the gate, a throwaway bare repo fetches
+   exactly that commit locally (without secrets) and the base branch from GitHub. The
+   checks run again on that SHA, and then `<sha>:refs/heads/<branch>` is pushed.
+   Credentialed git ignores `~/.gitconfig` and the system config, disables hooks and
+   fsmonitor, forces TLS verification, and gets a fresh `gh` config dir.
+4. **Nothing left running.** The gate runs in its own process group, killed when it
+   ends, and the dev server is stopped before any token is used again.
+5. **`.git` integrity.** A SHA-256 of `.git/config`, `commondir`, `hooks/` and `info/`
+   is compared with the post-setup value. On a mismatch the clone is deleted and
+   re-cloned, so a tampered config never meets `git fetch` with a token.
+6. **Protected paths.** A diff touching `PROTECTED_PATHS` (default `.github/ .githooks/
    .husky/ .gitattributes .gitmodules`) never becomes a PR, so the agent can't weaken
    the gate or CI. Leave the PAT without the *Workflows* permission too.
-5. **Strict output.** `result.json` is validated (verdicts, repo names, short-ID pattern,
+7. **Strict output.** `result.json` is validated (verdicts, repo names, short-ID pattern,
    no control characters) before anything uses it.
-6. **Humans merge.** Every change arrives as a PR against a protected branch.
+8. **Humans merge.** Every change arrives as a PR against a protected branch.
 
 **Known limits.** These are speed bumps, not a hard boundary, as long as the agent and the
 orchestrator share one Unix user:
 - A same-user process can read `/proc/<pid>/environ` of `run.sh`, which holds the tokens.
+  A process that detaches itself (a new session) also survives the gate's process-group kill.
 - Commands Claude runs inherit `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`.
+- Binaries in user-writable directories can be replaced: install `git`, `gh` and
+  `python3` system-wide (the unit puts system dirs first in `PATH`; `run.sh` warns otherwise).
+- The gate runs tests the agent wrote. It proves "nothing obvious broke", not "the fix is right".
 - With `.env` next to `run.sh` (handy for trying it out) the file is readable by agent code.
   Use the systemd layout above for unattended runs.
 
