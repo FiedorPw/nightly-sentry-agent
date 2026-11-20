@@ -1,0 +1,13 @@
+# Secrets and per-installation config: never commit
+.env
+.env.*
+!.env.example
+context.md
+
+# Runtime data
+work/
+runs/
+state/
+
+__pycache__/
+*.pyc

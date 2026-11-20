@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "nightly-sentry-agent result",
+  "type": "object",
+  "required": ["decisions", "prs"],
+  "additionalProperties": false,
+  "properties": {
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["short_id", "verdict", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "short_id": { "type": "string" },
+          "verdict": {
+            "enum": ["fixed", "skip_noise", "skip_low_impact", "skip_hard", "skip_duplicate", "abandoned"]
+          },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "prs": {
+      "type": "array",
+      "description": "At most one entry per repository; repo is the directory name.",
+      "items": {
+        "type": "object",
+        "required": ["repo", "short_id", "title", "body"],
+        "additionalProperties": false,
+        "properties": {
+          "repo": { "type": "string" },
+          "short_id": { "type": "string" },
+          "title": { "type": "string", "maxLength": 120 },
+          "body": { "type": "string" }
+        }
+      }
+    }
+  }
+}
