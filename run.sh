@@ -95,8 +95,10 @@ git_auth() {
   rm -rf "$d"
   return "$rc"
 }
-# Plain git for inspecting agent-touched clones: same hardening, no credentials
-git_safe() { git_fresh -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"; }
+# Plain git for inspecting agent-touched clones. Their .git/config can still define
+# programs (e.g. a clean filter that `git status` runs), so this always runs in a
+# subshell with every secret removed.
+git_safe() { (scrub_secrets; git_fresh -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"); }
 
 # SHA-256 over the parts of .git the agent could abuse to run code or redirect a push
 # (config: fsmonitor, aliases, filters, URLs; hooks/; info/attributes)
@@ -168,14 +170,25 @@ gate_isolated() {
   return "$rc"
 }
 
-# 0 (and prints the file) if the diff base...head touches a protected path prefix
+# 0 (and prints the file) if the diff base...head touches a protected path prefix.
+# Fails CLOSED: any git error counts as "protected", so a broken check never lets a
+# change through. -z gives raw, unquoted paths; --no-renames lists both the old and
+# the new path of a move, so moving a file out of .github/ is caught too.
 touches_protected() {
-  local repo="$1" base="$2" head="$3" file prefix
-  while IFS= read -r file; do
+  local repo="$1" base="$2" head="$3" file prefix list
+  if ! git_fresh -C "$repo" merge-base "$base" "$head" >/dev/null; then
+    echo "<no common history with $base>"; return 0
+  fi
+  list="$(mktemp)"
+  if ! git_fresh -C "$repo" diff --name-only -z --no-renames "$base...$head" > "$list"; then
+    rm -f "$list"; echo "<git diff failed>"; return 0
+  fi
+  while IFS= read -r -d '' file; do
     for prefix in $PROTECTED_PATHS; do
-      case "$file" in "$prefix"*) echo "$file"; return 0 ;; esac
+      case "$file" in "$prefix"*) rm -f "$list"; echo "$file"; return 0 ;; esac
     done
-  done < <(git_fresh -C "$repo" diff --name-only "$base...$head")
+  done < "$list"
+  rm -f "$list"
   return 1
 }
 
@@ -376,6 +389,13 @@ while IFS=$'\t' read -r name short_id title <&3; do
     log "$name: $1 - not pushing"
     printf '%s\t%s\t%s\n' "$short_id" "$TODAY" "gate_failed" >> "$STATE"
   }
+  tampered() { [ "$(git_fingerprint "$dir")" != "$(cat "$STATE_DIR/git_fp_$name")" ]; }
+  # Before any git call on the clone: did the agent touch .git/config or hooks?
+  if tampered; then
+    reject ".git config/hooks changed by the agent (clone deleted)"
+    rm -rf "$dir"
+    continue
+  fi
   if [ "$(git_safe -C "$dir" rev-list --count "origin/$BASE_BRANCH..HEAD")" -eq 0 ]; then
     log "$name: agent reported $short_id but made no commit - skipping"
     continue
@@ -390,9 +410,9 @@ while IFS=$'\t' read -r name short_id title <&3; do
   if ! gate_isolated "$dir" "$name" > "$RUN_DIR/gate_$name.log" 2>&1; then
     reject "test gate FAILED (see gate_$name.log)"; continue
   fi
-  # Checked AFTER the gate: the gate runs agent-written code that could touch .git.
+  # Checked again AFTER the gate: the gate runs agent-written code that could touch .git.
   # A tampered clone is deleted, so the next run starts from a fresh clone.
-  if [ "$(git_fingerprint "$dir")" != "$(cat "$STATE_DIR/git_fp_$name")" ]; then
+  if tampered; then
     reject ".git config/hooks changed during the run (clone deleted)"
     rm -rf "$dir"
     continue
