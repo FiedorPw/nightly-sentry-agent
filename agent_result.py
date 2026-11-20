@@ -11,8 +11,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
+# Sentry short IDs look like WEB-1A / MY_PROJECT-42. A strict pattern keeps agent
+# output from smuggling tabs, newlines or shell/path characters into the TSV state
+# file, file names or the exclude matching.
+SHORT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 VERDICTS = {"fixed", "skip_noise", "skip_low_impact", "skip_hard", "skip_duplicate", "abandoned"}
 # PR description footer, so reviewers know where the PR came from
 FOOTER = (
@@ -32,13 +37,15 @@ def validate(data: dict, repos: set[str]) -> list[str]:
         return ["result.json needs 'decisions' and 'prs' arrays"]
     errors = []
     for d in data["decisions"]:
-        if d.get("verdict") not in VERDICTS or not d.get("short_id"):
+        if d.get("verdict") not in VERDICTS or not SHORT_ID.match(str(d.get("short_id", ""))):
             errors.append(f"bad decision: {d}")
     seen_repos = set()
     for pr in data["prs"]:
         repo = pr.get("repo")
         if repo not in repos:
             errors.append(f"unknown repo: {repo}")
+        if not SHORT_ID.match(str(pr.get("short_id", ""))):
+            errors.append(f"bad short_id for {repo}: {pr.get('short_id')!r}")
         if repo in seen_repos:
             errors.append(f"more than one PR for {repo}")
         seen_repos.add(repo)

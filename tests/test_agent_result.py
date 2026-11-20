@@ -45,6 +45,14 @@ class ValidateTest(unittest.TestCase):
             with self.subTest(title=title):
                 self.assertTrue(agent_result.validate({"decisions": [], "prs": [pr(title=title)]}, REPOS))
 
+    def test_rejects_short_id_that_would_break_tsv(self):
+        for sid in ["A\tB", "A\nB", "", "../x", "a b"]:
+            with self.subTest(short_id=sid):
+                bad_decision = {"decisions": [{"short_id": sid, "verdict": "fixed", "reason": ""}], "prs": []}
+                self.assertTrue(agent_result.validate(bad_decision, REPOS))
+                bad_pr = {"decisions": [], "prs": [dict(pr(), short_id=sid)]}
+                self.assertTrue(agent_result.validate(bad_pr, REPOS))
+
     def test_rejects_empty_body(self):
         self.assertTrue(agent_result.validate({"decisions": [], "prs": [pr(body="")]}, REPOS))
 

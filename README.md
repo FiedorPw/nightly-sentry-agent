@@ -110,34 +110,52 @@ A repository without a pre-push hook or `gate.sh` never gets a PR.
 ## Running nightly with systemd
 
 ```bash
-sudo useradd -m -s /bin/bash sentry-agent
-sudo -iu sentry-agent git clone <this repo> ~/nightly-sentry-agent
-sudo install -m 600 -o root -g root ~sentry-agent/nightly-sentry-agent/.env.example /etc/nightly-sentry-agent.env
-sudo $EDITOR /etc/nightly-sentry-agent.env
-sudo cp ~sentry-agent/nightly-sentry-agent/systemd/nightly-sentry-agent.* /etc/systemd/system/
+sudo useradd -m -s /bin/bash sentry-agent             # then install claude, gh, bun/uv... as this user
+sudo git clone <this repo> /opt/nightly-sentry-agent  # root-owned: runs can't modify the code
+sudo install -m 600 /opt/nightly-sentry-agent/.env.example /etc/nightly-sentry-agent.env
+sudo $EDITOR /etc/nightly-sentry-agent.env            # tokens + SENTRY_ORG + GH_REPOS
+sudo $EDITOR /etc/nightly-sentry-agent.context.md     # optional project context
+sudo cp /opt/nightly-sentry-agent/systemd/nightly-sentry-agent.* /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl start nightly-sentry-agent.service && journalctl -fu nightly-sentry-agent
 sudo systemctl enable --now nightly-sentry-agent.timer
 ```
 
-`EnvironmentFile=` is read by systemd as root, so the token file can stay unreadable
-for the agent user. Adjust user, paths and `PATH` in the unit to your setup.
+`EnvironmentFile=` is read by systemd as root, so the token file stays unreadable for
+the agent user. Clones, run logs and state live in `/var/lib/nightly-sentry-agent`.
+Adjust the user and `PATH` in the unit to your setup.
 
 ## Security
 
-What protects you, and what does not:
+Sentry events carry user-controlled text, and the agent writes and runs code (tests).
+Assume that code can be hostile. What the script does about it:
 
-1. **Tokens never reach Claude's environment**, and Claude is denied `git push`, `gh`,
-   `curl`, `wget`, WebFetch and WebSearch.
-2. **The allow-list is not a sandbox.** The agent writes and runs code (tests), and that
-   code runs as the agent user. So:
-3. **Keep the machine boring:** no production secrets in the repositories' `.env` files,
-   minimal token scopes, a dedicated Unix user.
-4. **Humans merge.** Every change arrives as a PR against a protected branch, after an
-   independent test gate.
+1. **No secrets next to agent-influenced code.** `SENTRY_AUTH_TOKEN`, `GH_TOKEN` and
+   `GITHUB_TOKEN` are stripped from Claude's environment. Dependency installs, the dev
+   server and the test gate run with *all* tokens stripped.
+2. **Narrow tools.** Claude is denied `git push`, `gh`, `curl`, `wget`, WebFetch and
+   WebSearch, and may run only git plus the prefixes in `ALLOWED_BASH`.
+3. **`.git` integrity.** A SHA-256 of `.git/config`, `.git/hooks/` and `.git/info/` is
+   taken after setup and compared after the gate, right before pushing. On a mismatch
+   nothing is pushed and the clone is deleted. Git commands near the token run with
+   hooks and fsmonitor disabled.
+4. **Protected paths.** A diff touching `PROTECTED_PATHS` (default `.github/ .githooks/
+   .husky/ .gitattributes .gitmodules`) never becomes a PR, so the agent can't weaken
+   the gate or CI. Leave the PAT without the *Workflows* permission too.
+5. **Strict output.** `result.json` is validated (verdicts, repo names, short-ID pattern,
+   no control characters) before anything uses it.
+6. **Humans merge.** Every change arrives as a PR against a protected branch.
 
-A process can read `/proc/<pid>/environ` of its parent when both run as the same user.
-For full separation, run the push/PR step as a different user.
+**Known limits.** These are speed bumps, not a hard boundary, as long as the agent and the
+orchestrator share one Unix user:
+- A same-user process can read `/proc/<pid>/environ` of `run.sh`, which holds the tokens.
+- Commands Claude runs inherit `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`.
+- With `.env` next to `run.sh` (handy for trying it out) the file is readable by agent code.
+  Use the systemd layout above for unattended runs.
+
+So keep the machine boring: no production secrets in the repositories' `.env` files,
+minimal token scopes, nothing else of value on the box. A separate Unix user for the
+Claude + gate phase is the next hardening step (contributions welcome).
 
 ## Development
 

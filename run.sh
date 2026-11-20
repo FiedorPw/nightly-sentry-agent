@@ -12,8 +12,10 @@
 set -euo pipefail
 
 AGENT_HOME="${AGENT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-# `set -a` exports every variable the .env file defines
-if [ -f "$AGENT_HOME/.env" ]; then set -a; . "$AGENT_HOME/.env"; set +a; fi
+# `set -a` exports every variable the .env file defines. Fine for trying it out; for
+# unattended runs use a root-only EnvironmentFile (code run by the agent can read .env).
+dotenv_used=0
+if [ -f "$AGENT_HOME/.env" ]; then set -a; . "$AGENT_HOME/.env"; set +a; dotenv_used=1; fi
 
 # --- Configuration --------------------------------------------------------------
 : "${SENTRY_AUTH_TOKEN:?set SENTRY_AUTH_TOKEN (read-only scopes: org:read, project:read, event:read)}"
@@ -39,6 +41,8 @@ MIN_USERS="${MIN_USERS:-2}"
 MAX_FIX_LINES="${MAX_FIX_LINES:-50}"
 MAX_FIX_FILES="${MAX_FIX_FILES:-3}"
 RETRIAGE_DAYS="${RETRIAGE_DAYS:-7}"
+# A diff touching these path prefixes never becomes a PR (CI config, hooks = the gate itself)
+PROTECTED_PATHS="${PROTECTED_PATHS:-.github/ .githooks/ .husky/ .gitattributes .gitmodules}"
 DRY_RUN="${DRY_RUN:-0}"
 
 STATE="$STATE_DIR/handled.tsv"
@@ -53,15 +57,48 @@ touch "$STATE"
 # Mirror all output into the run folder; under systemd it also lands in journald
 exec > >(tee -a "$RUN_DIR/run.log") 2>&1
 log() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
+if [ "$dotenv_used" = "1" ]; then
+  log "WARN: secrets loaded from $AGENT_HOME/.env - code run by the agent can read that file; use a root-only EnvironmentFile for unattended runs"
+fi
 
-# git with GH_TOKEN as credentials (via gh), without touching the global git config
-git_auth() { git -c credential.helper= -c 'credential.https://github.com.helper=!gh auth git-credential' "$@"; }
+# Every process whose code the agent can influence (dependency install scripts, the
+# dev server, the test gate) runs with these removed from its environment.
+scrub_secrets() { unset SENTRY_AUTH_TOKEN GH_TOKEN GITHUB_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; }
+
+# git with GH_TOKEN as credentials (via gh), without touching the global git config.
+# Hooks and fsmonitor are disabled so no repo-controlled program runs next to the token.
+git_auth() {
+  git -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+    -c credential.helper= -c 'credential.https://github.com.helper=!gh auth git-credential' "$@"
+}
+# Plain git for inspecting agent-touched clones: same hardening, no credentials
+git_safe() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"; }
+
+# SHA-256 over the parts of .git the agent could abuse to run code or redirect a push
+# (config: fsmonitor, aliases, filters, URLs; hooks/; info/attributes)
+git_fingerprint() {
+  python3 - "$1/.git" <<'PY'
+import hashlib, os, sys
+root, h = sys.argv[1], hashlib.sha256()
+for part in ("config", "hooks", "info"):
+    base = os.path.join(root, part)
+    paths = [base] if os.path.isfile(base) else sorted(
+        os.path.join(d, f) for d, _, files in os.walk(base) for f in files)
+    for p in paths:
+        h.update(p.encode() + b"\0")
+        with open(p, "rb") as fh:
+            h.update(fh.read())
+print(h.hexdigest())
+PY
+}
 
 # Install dependencies: repo-hooks/<name>/setup.sh if present, else guess from the lockfile
 install_deps() {
   local dir="$1" name="$2" custom="$AGENT_HOME/repo-hooks/$2/setup.sh"
-  if [ -x "$custom" ]; then (cd "$dir" && "$custom"); return; fi
+  if [ -x "$custom" ]; then (scrub_secrets; cd "$dir" && "$custom"); return; fi
   (
+    # Install scripts of dependencies are third-party code: no tokens for them
+    scrub_secrets
     cd "$dir"
     if   [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile >/dev/null
     elif [ -f pnpm-lock.yaml ];   then pnpm install --frozen-lockfile >/dev/null
@@ -75,16 +112,32 @@ install_deps() {
 
 # Test gate: repo-hooks/<name>/gate.sh if present, else the repo's own pre-push hook.
 # `git rev-parse --git-path hooks` honours core.hooksPath (husky, .githooks, ...).
+# The gate executes code the agent wrote (tests), so it runs without any secret;
+# .git integrity and PROTECTED_PATHS are checked before it (see step 6).
 run_gate() {
-  local dir="$1" name="$2" custom="$AGENT_HOME/repo-hooks/$2/gate.sh" hooks
-  if [ -x "$custom" ]; then (cd "$dir" && "$custom"); return; fi
-  hooks="$(cd "$dir" && git rev-parse --git-path hooks)"
-  case "$hooks" in /*) ;; *) hooks="$dir/$hooks" ;; esac
-  if [ -x "$hooks/pre-push" ]; then
-    (cd "$dir" && "$hooks/pre-push" origin "$(git remote get-url origin)" </dev/null)
-    return
-  fi
-  echo "no test gate for $name: add a pre-push hook or repo-hooks/$name/gate.sh" >&2
+  local dir="$1" name="$2" custom="$AGENT_HOME/repo-hooks/$2/gate.sh"
+  (
+    scrub_secrets
+    cd "$dir"
+    if [ -x "$custom" ]; then exec "$custom"; fi
+    hooks="$(git rev-parse --git-path hooks)"
+    case "$hooks" in /*) ;; *) hooks="$dir/$hooks" ;; esac
+    if [ -x "$hooks/pre-push" ]; then
+      exec "$hooks/pre-push" origin "$(git remote get-url origin)" </dev/null
+    fi
+    echo "no test gate for $name: add a pre-push hook or repo-hooks/$name/gate.sh" >&2
+    exit 1
+  )
+}
+
+# 0 if the agent's diff touches a protected path prefix
+touches_protected() {
+  local dir="$1" file prefix
+  while IFS= read -r file; do
+    for prefix in $PROTECTED_PATHS; do
+      case "$file" in "$prefix"*) echo "$file"; return 0 ;; esac
+    done
+  done < <(git_safe -C "$dir" diff --name-only "origin/$BASE_BRANCH...HEAD")
   return 1
 }
 
@@ -92,6 +145,13 @@ run_gate() {
 for slug in "${REPOS[@]}"; do
   name="${slug#*/}"
   dir="$WORK_DIR/$name"
+  fp_file="$STATE_DIR/git_fp_$name"
+  # .git changed since the end of the last setup (e.g. by code a previous run left
+  # running): don't run git next to a token in it, start from a fresh clone instead
+  if [ -d "$dir/.git" ] && [ -f "$fp_file" ] && [ "$(git_fingerprint "$dir")" != "$(cat "$fp_file")" ]; then
+    log "WARN: $name/.git changed outside the setup step - re-cloning"
+    rm -rf "$dir"
+  fi
   if [ ! -d "$dir/.git" ]; then
     log "Cloning $slug"
     git_auth clone --quiet "https://github.com/$slug.git" "$dir"
@@ -99,10 +159,16 @@ for slug in "${REPOS[@]}"; do
   git_auth -C "$dir" fetch --quiet --prune origin
   # Throw away anything a previous run left behind, then branch off the newest base.
   # `clean` without -x keeps ignored files (.env*, node_modules, .venv).
-  git -C "$dir" reset --quiet --hard
-  git -C "$dir" checkout --quiet -B "$BRANCH" "origin/$BASE_BRANCH"
-  git -C "$dir" clean -fdq
+  # Checkout can run filters from .git/config, so no secrets in this subshell.
+  (
+    scrub_secrets
+    git_safe -C "$dir" reset --quiet --hard
+    git_safe -C "$dir" checkout --quiet -B "$BRANCH" "origin/$BASE_BRANCH"
+    git_safe -C "$dir" clean -fdq
+  )
   install_deps "$dir" "$name"
+  # Trusted state of .git (install scripts such as husky may set core.hooksPath)
+  git_fingerprint "$dir" > "$fp_file"
 done
 
 # --- 2. Inputs for the agent ------------------------------------------------------
@@ -137,7 +203,9 @@ trap cleanup EXIT
 mcp_args=(--strict-mcp-config)   # never load MCP servers from the user's global config
 if [ -n "$DEV_SERVER_CMD" ] && [ -n "$DEV_SERVER_URL" ] && [ -n "$DEV_SERVER_REPO" ]; then
   log "Starting dev server: $DEV_SERVER_CMD"
-  setsid bash -c "cd '$WORK_DIR/$DEV_SERVER_REPO' && exec $DEV_SERVER_CMD" \
+  # The dev server hot-reloads code the agent edits: start it without any secret
+  env -u SENTRY_AUTH_TOKEN -u GH_TOKEN -u GITHUB_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY \
+    setsid bash -c "cd '$WORK_DIR/$DEV_SERVER_REPO' && exec $DEV_SERVER_CMD" \
     > "$RUN_DIR/dev-server.log" 2>&1 &
   dev_pgid=$!
   # Slow machines (a Raspberry Pi) need a while for the first compile: up to 4 min
@@ -235,21 +303,33 @@ python3 "$AGENT_HOME/agent_result.py" decisions "$result" "$TODAY" | tee -a "$ST
 while IFS=$'\t' read -r name short_id title <&3; do
   dir="$WORK_DIR/$name"
   slug=""
-  for s in "${REPOS[@]}"; do [ "${s#*/}" = "$name" ] && slug="$s"; done
-  if [ "$(git -C "$dir" rev-list --count "origin/$BASE_BRANCH..HEAD")" -eq 0 ]; then
+  for s in "${REPOS[@]}"; do if [ "${s#*/}" = "$name" ]; then slug="$s"; fi; done
+  # validate already checked this; never act on a name outside GH_REPOS anyway
+  if [ -z "$slug" ]; then log "unknown repo '$name' in result - skipping"; continue; fi
+  reject() {
+    log "$name: $1 - not pushing"
+    printf '%s\t%s\t%s\n' "$short_id" "$TODAY" "gate_failed" >> "$STATE"
+  }
+  if [ "$(git_safe -C "$dir" rev-list --count "origin/$BASE_BRANCH..HEAD")" -eq 0 ]; then
     log "$name: agent reported $short_id but made no commit - skipping"
     continue
   fi
-  if [ -n "$(git -C "$dir" status --porcelain)" ]; then
-    log "$name: uncommitted changes left behind - skipping"
-    printf '%s\t%s\t%s\n' "$short_id" "$TODAY" "gate_failed" >> "$STATE"
-    continue
+  if [ -n "$(git_safe -C "$dir" status --porcelain)" ]; then
+    reject "uncommitted changes left behind"; continue
+  fi
+  if protected="$(touches_protected "$dir")"; then
+    reject "diff touches protected path $protected"; continue
   fi
   # Independent gate: don't trust the agent's word that tests pass
   log "$name: running test gate"
   if ! run_gate "$dir" "$name" > "$RUN_DIR/gate_$name.log" 2>&1; then
-    log "$name: test gate FAILED - not pushing (see gate_$name.log)"
-    printf '%s\t%s\t%s\n' "$short_id" "$TODAY" "gate_failed" >> "$STATE"
+    reject "test gate FAILED (see gate_$name.log)"; continue
+  fi
+  # Checked AFTER the gate: the gate runs agent-written code that could touch .git.
+  # A tampered clone is deleted, so the next run starts from a fresh clone.
+  if [ "$(git_fingerprint "$dir")" != "$(cat "$STATE_DIR/git_fp_$name")" ]; then
+    reject ".git config/hooks changed during the run (clone deleted)"
+    rm -rf "$dir"
     continue
   fi
   if [ "$DRY_RUN" = "1" ]; then

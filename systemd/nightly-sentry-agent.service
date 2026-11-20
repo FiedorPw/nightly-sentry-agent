@@ -5,15 +5,21 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-# Adjust the user and paths to your installation
 User=sentry-agent
 # Read by systemd as root before dropping to User=, so the file can stay root-only
 # (chmod 600) and the agent user cannot open it.
 EnvironmentFile=/etc/nightly-sentry-agent.env
+# Code lives in a root-owned directory the agent user cannot modify, so nothing a run
+# executes can change what the next night runs. Data goes to /var/lib (StateDirectory).
+StateDirectory=nightly-sentry-agent
+Environment=WORK_DIR=/var/lib/nightly-sentry-agent/work
+Environment=STATE_DIR=/var/lib/nightly-sentry-agent/state
+Environment=RUNS_DIR=/var/lib/nightly-sentry-agent/runs
+Environment=CONTEXT_FILE=/etc/nightly-sentry-agent.context.md
 # systemd starts with a minimal PATH; claude/uv live in ~/.local/bin, bun in ~/.bun/bin
 Environment=PATH=/home/sentry-agent/.local/bin:/home/sentry-agent/.bun/bin:/usr/local/bin:/usr/bin:/bin
-WorkingDirectory=/home/sentry-agent/nightly-sentry-agent
-ExecStart=/home/sentry-agent/nightly-sentry-agent/run.sh
+WorkingDirectory=/var/lib/nightly-sentry-agent
+ExecStart=/opt/nightly-sentry-agent/run.sh
 # CLAUDE_TIMEOUT defaults to 3 h; leave room for installs, the gate and the push
 TimeoutStartSec=4h
 Nice=10
